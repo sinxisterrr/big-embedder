@@ -233,25 +233,30 @@ app.post('/cache/clear', (_req, res) => {
 
 const PORT = process.env.PORT || 3001; // Different port than regular embedder
 
-// Load model then start server
-loadModel().then(() => {
-  app.listen(PORT, '0.0.0.0', () => {
+// Start server FIRST (so Railway healthcheck can connect), then load model
+app.listen(PORT, '0.0.0.0', () => {
+  console.log('='.repeat(60));
+  console.log(`🚀 BIG EMBEDDER service listening on port ${PORT}`);
+  console.log(`📍 Endpoints:`);
+  console.log(`   GET  /health         - Health check with stats`);
+  console.log(`   POST /embed          - Single text embedding`);
+  console.log(`   POST /embed/batch    - Batch embeddings`);
+  console.log(`   POST /cache/clear    - Clear cache (debug)`);
+  console.log('='.repeat(60));
+  console.log(`⏳ Server up, now loading model in background...`);
+
+  // Load model in background after server starts
+  loadModel().then(() => {
     console.log('='.repeat(60));
-    console.log(`🚀 BIG EMBEDDER service listening on port ${PORT}`);
+    console.log(`✅ BIG EMBEDDER fully ready!`);
     console.log(`📊 Model: bge-large-en-v1.5 (1024 dimensions)`);
     console.log(`💾 Cache: ${MAX_CACHE_SIZE} entries max`);
     console.log(`🔗 Ready for high-dimensional embeddings!`);
     console.log(`⚡ 2.67x more dimensional space than standard embedder`);
     console.log('='.repeat(60));
-    console.log(`📍 Endpoints:`);
-    console.log(`   GET  /health         - Health check with stats`);
-    console.log(`   POST /embed          - Single text embedding`);
-    console.log(`   POST /embed/batch    - Batch embeddings`);
-    console.log(`   POST /cache/clear    - Clear cache (debug)`);
-    console.log('='.repeat(60));
+  }).catch(err => {
+    console.error('❌ Failed to load BIG model:', err);
+    console.error('   Stack:', err.stack);
+    process.exit(1);
   });
-}).catch(err => {
-  console.error('❌ Failed to load BIG model:', err);
-  console.error('   Stack:', err.stack);
-  process.exit(1);
 });
