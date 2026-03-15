@@ -234,7 +234,7 @@ app.post('/cache/clear', (_req, res) => {
 const PORT = process.env.PORT || 3001; // Different port than regular embedder
 
 // Start server FIRST (so Railway healthcheck can connect), then load model
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, 'localhost', () => {
   console.log('='.repeat(60));
   console.log(`🚀 BIG EMBEDDER service listening on port ${PORT}`);
   console.log(`📍 Endpoints:`);
