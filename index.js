@@ -1,5 +1,12 @@
 import express from 'express';
-import { pipeline } from '@xenova/transformers';
+import { pipeline, env } from '@xenova/transformers';
+
+// Use the model baked into the Docker image; never hit the network at runtime.
+// Falls back to default (network) when running locally without the baked image.
+if (process.env.RAILWAY_ENVIRONMENT) {
+  env.cacheDir = '/app/models';
+  env.allowRemoteModels = false;
+}
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
