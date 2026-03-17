@@ -125,6 +125,8 @@ Embeddings are cached in memory (up to 5,000 entries, LRU eviction). Repeated te
 
 ---
 
-## Part of the Sage Ecosystem
+## 💜 Built By
 
-This embedder is part of [Sage](https://discord.gg/Pa2U2g5hUd) — a Discord AI companion with persistent memory, voice, and an autonomous inner life. 🖤
+**Sin & Hex** — we build AI companion infrastructure.  
+[![Discord](https://github.com/sinxisterrr/sage-core/blob/main/scripts/discord_badge.svg)](https://discord.gg/Pa2U2g5hUd) [![Patreon](https://github.com/sinxisterrr/sage-core/blob/main/scripts/patreon_badge.svg)](https://patreon.com/SinXHex)
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/Z8Z31W5CFK)
