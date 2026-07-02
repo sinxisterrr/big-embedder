@@ -239,7 +239,7 @@ app.post('/cache/clear', (_req, res) => {
 });
 
 const PORT = process.env.PORT || 3001; // Different port than regular embedder
-const HOST = process.env.RAILWAY_ENVIRONMENT ? '0.0.0.0' : 'localhost';
+const HOST = process.env.HOST || (process.env.RAILWAY_ENVIRONMENT ? '0.0.0.0' : 'localhost');
 
 // Start server FIRST (so Railway healthcheck can connect), then load model
 app.listen(PORT, HOST, () => {
