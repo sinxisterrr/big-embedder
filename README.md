@@ -113,7 +113,10 @@ Clears the embedding cache and resets stats. Useful during development.
 
 ## Caching
 
-Embeddings are cached in memory (up to 5,000 entries, LRU eviction). Repeated texts — common during re-runs or incremental parsing — return instantly without hitting the model.
+Embeddings are cached in memory (1,000 entries by default, configurable with
+`EMBEDDING_CACHE_SIZE`, true LRU eviction). Repeated texts return instantly
+without hitting the model. Cache keys hash the complete text, so two long
+messages with the same opening cannot receive each other's embeddings.
 
 ---
 
@@ -122,6 +125,32 @@ Embeddings are cached in memory (up to 5,000 entries, LRU eviction). Repeated te
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `3001` | Port to listen on |
+| `HOST` | `0.0.0.0` | Bind address |
+| `OFFLINE_MODE` | `false` | Set `true` to disable runtime model downloads |
+| `MODEL_CACHE_PATH` | `/app/models` | Mounted model-cache directory |
+| `EMBEDDING_CACHE_SIZE` | `1000` | Maximum in-memory embedding entries per container |
+| `MAX_BATCH_SIZE` | `128` | Maximum texts accepted by one batch request |
+| `MAX_QUEUE_DEPTH` | `128` | Maximum active and queued inference jobs |
+| `MAX_TEXT_CHARS` | `50000` | Maximum characters accepted per text |
+| `REQUEST_TIMEOUT_MS` | `45000` | HTTP request/item timeout |
+| `INFERENCE_HARD_TIMEOUT_MS` | `120000` | Exit and let the container recover if ONNX wedges this long |
+| `MODEL_LOAD_TIMEOUT_MS` | `300000` | Exit if model loading cannot complete |
+
+### Coolify recovery settings
+
+- Health check path: `/health`
+- Health check port: the same value as `PORT`
+- Keep the model mount at `/app/models` and set `OFFLINE_MODE=true` when using the server cache.
+
+The image includes a lightweight worker supervisor. If the native ONNX worker
+wedges, hits an uncaught failure, or trips the inference watchdog, it is
+restarted inside the existing container with exponential backoff. A platform
+restart policy is still useful for a whole-container OOM, but is not required
+for ordinary worker recovery.
+
+The service serializes model inference deliberately. ONNX already uses native
+threads; running an entire batch through `Promise.all` multiplies memory use and
+can wedge or OOM the container. Batch responses keep their original ordering.
 
 ---
 

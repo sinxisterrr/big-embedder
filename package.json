@@ -5,7 +5,8 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node supervisor.js",
+    "test": "node --test"
   },
   "dependencies": {
     "express": "^4.18.2",

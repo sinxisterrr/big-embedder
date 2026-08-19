@@ -1,270 +1,217 @@
 import express from 'express';
 import { pipeline, env } from '@xenova/transformers';
+import {
+  LruEmbeddingCache,
+  SerialInferenceQueue,
+  positiveInteger,
+  validateText,
+  withTimeout,
+} from './runtime.js';
 
-// Use the model baked into the Docker image; never hit the network at runtime.
-// Falls back to default (network) when running locally without the baked image.
-if (process.env.RAILWAY_ENVIRONMENT) {
-  env.cacheDir = '/app/models';
+if (process.env.RAILWAY_ENVIRONMENT || process.env.OFFLINE_MODE === 'true') {
+  env.cacheDir = process.env.MODEL_CACHE_PATH || '/app/models';
   env.allowRemoteModels = false;
 }
 
+const PORT = positiveInteger(process.env.PORT, 3001);
+const HOST = process.env.HOST || '0.0.0.0';
+const MAX_CACHE_SIZE = positiveInteger(process.env.EMBEDDING_CACHE_SIZE, 1000);
+const MAX_BATCH_SIZE = positiveInteger(process.env.MAX_BATCH_SIZE, 128);
+const MAX_TEXT_CHARS = positiveInteger(process.env.MAX_TEXT_CHARS, 50_000);
+const MAX_QUEUE_DEPTH = positiveInteger(process.env.MAX_QUEUE_DEPTH, 128);
+const REQUEST_TIMEOUT_MS = positiveInteger(process.env.REQUEST_TIMEOUT_MS, 45_000);
+const INFERENCE_HARD_TIMEOUT_MS = positiveInteger(process.env.INFERENCE_HARD_TIMEOUT_MS, 120_000);
+const MODEL_LOAD_TIMEOUT_MS = positiveInteger(process.env.MODEL_LOAD_TIMEOUT_MS, 300_000);
+
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.disable('x-powered-by');
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '2mb' }));
 
 let embedder = null;
-
-// Server-side cache for embeddings
-const embeddingCache = new Map();
-const MAX_CACHE_SIZE = 5000;
-
-// Performance tracking
+let modelState = 'loading';
+let modelError = '';
 let requestCount = 0;
 let cacheHits = 0;
 let batchRequestNumber = 0;
 
-// Cache helper
-function getCacheKey(text) {
-  return text.slice(0, 300); // Use first 300 chars as key
-}
+const embeddingCache = new LruEmbeddingCache(MAX_CACHE_SIZE);
+const inferenceQueue = new SerialInferenceQueue(MAX_QUEUE_DEPTH);
 
-function cacheGet(key) {
-  if (embeddingCache.has(key)) {
-    cacheHits++;
-    return embeddingCache.get(key);
-  }
-  return null;
-}
-
-function cacheSet(key, value) {
-  if (embeddingCache.size >= MAX_CACHE_SIZE) {
-    // Remove oldest entry (first key)
-    const firstKey = embeddingCache.keys().next().value;
-    if (firstKey) {
-      embeddingCache.delete(firstKey);
-    }
-  }
-  embeddingCache.set(key, value);
-}
-
-// Load the model on startup
-async function loadModel() {
-  console.log('🔄 Loading BIG embedding model (bge-large-en-v1.5 - 1024 dims)...');
-  console.log('   This may take a few minutes on first run (downloading ~1.3GB model)...');
-  const start = Date.now();
-
-  // Use bge-large-en-v1.5 for 1024 dimensions
-  embedder = await pipeline('feature-extraction', 'Xenova/bge-large-en-v1.5');
-
-  const elapsed = ((Date.now() - start) / 1000).toFixed(2);
-  console.log(`✅ BIG model loaded in ${elapsed}s`);
-  console.log(`   Model: bge-large-en-v1.5`);
-  console.log(`   Dimensions: 1024 (2.67x larger than standard 384)`);
-}
-
-// Generate embedding with caching
-async function generateEmbedding(text) {
-  const cacheKey = getCacheKey(text);
-
-  // Check cache first
-  const cached = cacheGet(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  // Generate new embedding
-  const output = await embedder(text, { pooling: 'mean', normalize: true });
-  const embedding = Array.from(output.data);
-
-  // Cache it
-  cacheSet(cacheKey, embedding);
-
-  return embedding;
-}
-
-// Health check
-app.get('/health', (_req, res) => {
-  const response = {
-    status: 'ok',
+function healthSnapshot() {
+  const activeAgeMs = inferenceQueue.activeAgeMs;
+  const stalled = activeAgeMs > INFERENCE_HARD_TIMEOUT_MS;
+  return {
+    status: modelState === 'ready' && !stalled ? 'ok' : 'unavailable',
+    ready: modelState === 'ready' && !stalled,
+    modelState,
+    modelError: modelError || undefined,
     model: 'bge-large-en-v1.5',
-    ready: embedder !== null,
     dimensions: 1024,
+    queue: {
+      pending: inferenceQueue.pending,
+      activeAgeMs,
+      activeLabel: inferenceQueue.activeLabel || undefined,
+      maxDepth: MAX_QUEUE_DEPTH,
+    },
     stats: {
       requests: requestCount,
       cacheHits,
       cacheSize: embeddingCache.size,
-      hitRate: requestCount > 0 ? (cacheHits / requestCount * 100).toFixed(1) + '%' : '0%'
-    }
+      cacheLimit: MAX_CACHE_SIZE,
+      hitRate: requestCount > 0 ? `${(cacheHits / requestCount * 100).toFixed(1)}%` : '0%',
+      rssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+    },
   };
+}
 
-  console.log(`💓 Health check: ${embedder ? 'READY' : 'NOT READY'} (requests: ${requestCount}, cache: ${embeddingCache.size}/${MAX_CACHE_SIZE}, hit rate: ${response.stats.hitRate})`);
-
-  res.json(response);
-});
-
-// Single text embedding
-app.post('/embed', async (req, res) => {
-  const start = Date.now();
-
+async function loadModel() {
+  console.log('🔄 Loading bge-large-en-v1.5 (1024 dimensions)...');
+  const startedAt = Date.now();
   try {
-    if (!embedder) {
-      console.warn('⚠️ Embed request but model not loaded yet');
-      return res.status(503).json({ error: 'Model not loaded yet' });
-    }
-
-    const { text } = req.body;
-
-    if (!text) {
-      console.warn('⚠️ Embed request missing text field');
-      return res.status(400).json({ error: 'Missing "text" field' });
-    }
-
-    const textPreview = text.slice(0, 80).replace(/\n/g, ' ');
-    console.log(`📥 Embed request: "${textPreview}..." (${text.length} chars)`);
-
-    requestCount++;
-    const cacheKey = getCacheKey(text);
-    const wasCached = embeddingCache.has(cacheKey);
-
-    const embedding = await generateEmbedding(text);
-
-    const elapsed = Date.now() - start;
-    const cacheStatus = wasCached ? '💾 CACHE HIT' : '🔄 GENERATED';
-    console.log(`✅ ${cacheStatus}: ${elapsed}ms (${embedding.length} dims, cache: ${embeddingCache.size}/${MAX_CACHE_SIZE})`);
-
-    const response = {
-      embedding,
-      dimensions: embedding.length
-    };
-
-    res.json(response);
-    console.log(`📤 Response sent (${JSON.stringify(response).length} bytes)`);
-
-  } catch (error) {
-    console.error('❌ Embedding error:', error.message);
-    console.error('   Stack:', error.stack);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Batch embeddings with parallel processing + caching
-app.post('/embed/batch', async (req, res) => {
-  const start = Date.now();
-
-  try {
-    if (!embedder) {
-      console.warn('⚠️ Batch embed request but model not loaded yet');
-      return res.status(503).json({ error: 'Model not loaded yet' });
-    }
-
-    const { texts } = req.body;
-
-    if (!Array.isArray(texts)) {
-      console.warn('⚠️ Batch embed request missing texts array');
-      return res.status(400).json({ error: 'Missing "texts" array' });
-    }
-
-    batchRequestNumber++;
-    console.log('─'.repeat(60));
-    console.log(`📥 BIG-EMBEDDER Batch #${batchRequestNumber}: ${texts.length} texts to embed (1024 dims)`);
-    console.log(`   Source: ${req.ip || 'unknown'} | Time: ${new Date().toLocaleTimeString()}`);
-
-    // Check how many are cached
-    const cacheStatus = texts.map(text => embeddingCache.has(getCacheKey(text)));
-    const cachedCount = cacheStatus.filter(Boolean).length;
-    const newCount = texts.length - cachedCount;
-
-    if (cachedCount > 0) {
-      console.log(`   💾 ${cachedCount} cached, 🔄 ${newCount} to generate`);
-    }
-
-    requestCount += texts.length;
-
-    // Process all in parallel with caching and progress tracking
-    let completed = 0;
-    const total = texts.length;
-
-    const embeddings = await Promise.all(
-      texts.map(async (text, i) => {
-        const result = await generateEmbedding(text);
-        completed++;
-
-        // Log progress every 10% or every 50 items (whichever is smaller)
-        const progressInterval = Math.min(50, Math.max(1, Math.floor(total / 10)));
-        if (completed % progressInterval === 0 || completed === total) {
-          const pct = ((completed / total) * 100).toFixed(0);
-          const bar = '█'.repeat(Math.floor(completed / total * 20)) + '░'.repeat(20 - Math.floor(completed / total * 20));
-          console.log(`   [${bar}] ${completed}/${total} (${pct}%)`);
-        }
-
-        return result;
-      })
+    embedder = await withTimeout(
+      pipeline('feature-extraction', 'Xenova/bge-large-en-v1.5'),
+      MODEL_LOAD_TIMEOUT_MS,
+      'Model load',
     );
-
-    const elapsed = Date.now() - start;
-    const avgTime = (elapsed / texts.length).toFixed(1);
-    const throughput = (texts.length / (elapsed / 1000)).toFixed(0);
-
-    console.log(`✅ BIG-EMBEDDER Batch #${batchRequestNumber} complete:`);
-    console.log(`   ⏱️  ${elapsed}ms total (avg ${avgTime}ms/item)`);
-    console.log(`   🚀 Throughput: ${throughput} embeddings/sec`);
-    console.log(`   💾 Cache: ${embeddingCache.size}/${MAX_CACHE_SIZE} entries`);
-    console.log(`   📊 Hit rate: ${requestCount > 0 ? (cacheHits / requestCount * 100).toFixed(1) : '0'}%`);
-
-    const response = {
-      embeddings,
-      count: embeddings.length,
-      dimensions: embeddings[0]?.length || 0
-    };
-
-    res.json(response);
-    const responseSize = (JSON.stringify(response).length / 1024).toFixed(1);
-    console.log(`📤 Response sent: ${responseSize}KB`);
-    console.log('─'.repeat(60));
-
+    modelState = 'ready';
+    console.log(`✅ Model ready in ${((Date.now() - startedAt) / 1000).toFixed(2)}s`);
   } catch (error) {
-    console.error('❌ Batch embedding error:', error.message);
-    console.error('   Stack:', error.stack);
-    res.status(500).json({ error: error.message });
+    modelState = 'failed';
+    modelError = error instanceof Error ? error.message : String(error);
+    console.error(`❌ Model load failed: ${modelError}`);
+    setTimeout(() => process.exit(1), 100).unref();
+  }
+}
+
+async function generateEmbedding(text) {
+  const cached = embeddingCache.get(text);
+  if (cached) {
+    cacheHits++;
+    return { embedding: cached, cached: true };
+  }
+
+  const embedding = await inferenceQueue.run(`text:${text.length}`, async () => {
+    const output = await embedder(text, { pooling: 'mean', normalize: true });
+    const values = Array.from(output.data);
+    if (values.length !== 1024 || values.some(value => !Number.isFinite(value))) {
+      throw new Error(`Model returned an invalid embedding (${values.length} dimensions)`);
+    }
+    return values;
+  });
+  embeddingCache.set(text, embedding);
+  return { embedding, cached: false };
+}
+
+function requireReady(res) {
+  if (modelState === 'ready' && embedder) return true;
+  res.status(503).json({ error: 'Embedding model is not ready', modelState, modelError: modelError || undefined });
+  return false;
+}
+
+function sendError(res, error) {
+  const status = Number(error?.statusCode) || 500;
+  const message = error instanceof Error ? error.message : String(error);
+  if (status >= 500) console.error(`❌ Embedding request failed: ${message}`);
+  res.status(status).json({ error: message });
+}
+
+app.get('/live', (_req, res) => res.json({ status: 'alive' }));
+
+app.get('/health', (_req, res) => {
+  const snapshot = healthSnapshot();
+  res.status(snapshot.ready ? 200 : 503).json(snapshot);
+});
+
+app.post('/embed', async (req, res) => {
+  if (!requireReady(res)) return;
+  const startedAt = Date.now();
+  try {
+    const text = validateText(req.body?.text, MAX_TEXT_CHARS);
+    requestCount++;
+    const result = await withTimeout(generateEmbedding(text), REQUEST_TIMEOUT_MS, 'Embedding request');
+    res.json({ embedding: result.embedding, dimensions: result.embedding.length });
+    console.log(`✅ ${result.cached ? 'CACHE' : 'MODEL'} ${Date.now() - startedAt}ms (${text.length} chars, queue=${inferenceQueue.pending}, rss=${healthSnapshot().stats.rssMb}MB)`);
+  } catch (error) {
+    sendError(res, error);
   }
 });
 
-// Clear cache endpoint (optional - for debugging)
+app.post('/embed/batch', async (req, res) => {
+  if (!requireReady(res)) return;
+  const startedAt = Date.now();
+  try {
+    if (!Array.isArray(req.body?.texts) || req.body.texts.length === 0) {
+      const error = new Error('Missing non-empty "texts" array');
+      error.statusCode = 400;
+      throw error;
+    }
+    if (req.body.texts.length > MAX_BATCH_SIZE) {
+      const error = new Error(`Batch exceeds ${MAX_BATCH_SIZE} item limit`);
+      error.statusCode = 413;
+      throw error;
+    }
+
+    const texts = req.body.texts.map(text => validateText(text, MAX_TEXT_CHARS));
+    const requestNumber = ++batchRequestNumber;
+    requestCount += texts.length;
+    let cachedCount = 0;
+    const embeddings = [];
+
+    // Intentionally sequential. ONNX inference is already internally threaded;
+    // Promise.all here multiplied model work and caused container memory spikes.
+    for (const text of texts) {
+      const result = await withTimeout(generateEmbedding(text), REQUEST_TIMEOUT_MS, 'Batch embedding item');
+      if (result.cached) cachedCount++;
+      embeddings.push(result.embedding);
+    }
+
+    res.json({ embeddings, count: embeddings.length, dimensions: embeddings[0]?.length || 0 });
+    console.log(`✅ Batch #${requestNumber}: ${embeddings.length} items (${cachedCount} cached) in ${Date.now() - startedAt}ms, rss=${healthSnapshot().stats.rssMb}MB`);
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
 app.post('/cache/clear', (_req, res) => {
-  const prevSize = embeddingCache.size;
-  embeddingCache.clear();
+  const entriesRemoved = embeddingCache.clear();
   cacheHits = 0;
   requestCount = 0;
-  console.log(`🧹 Cache cleared (removed ${prevSize} entries, reset stats)`);
-  res.json({ status: 'cache cleared', entriesRemoved: prevSize });
+  res.json({ status: 'cache cleared', entriesRemoved });
 });
 
-const PORT = process.env.PORT || 3001; // Different port than regular embedder
-const HOST = process.env.HOST || (process.env.RAILWAY_ENVIRONMENT ? '0.0.0.0' : 'localhost');
+app.use((error, _req, res, _next) => {
+  if (error?.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request body is too large' });
+  }
+  sendError(res, error);
+});
 
-// Start server FIRST (so Railway healthcheck can connect), then load model
-app.listen(PORT, HOST, () => {
-  console.log('='.repeat(60));
-  console.log(`🚀 BIG EMBEDDER service listening on port ${PORT}`);
-  console.log(`📍 Endpoints:`);
-  console.log(`   GET  /health         - Health check with stats`);
-  console.log(`   POST /embed          - Single text embedding`);
-  console.log(`   POST /embed/batch    - Batch embeddings`);
-  console.log(`   POST /cache/clear    - Clear cache (debug)`);
-  console.log('='.repeat(60));
-  console.log(`⏳ Server up, now loading model in background...`);
-
-  // Load model in background after server starts
-  loadModel().then(() => {
-    console.log('='.repeat(60));
-    console.log(`✅ BIG EMBEDDER fully ready!`);
-    console.log(`📊 Model: bge-large-en-v1.5 (1024 dimensions)`);
-    console.log(`💾 Cache: ${MAX_CACHE_SIZE} entries max`);
-    console.log(`🔗 Ready for high-dimensional embeddings!`);
-    console.log(`⚡ 2.67x more dimensional space than standard embedder`);
-    console.log('='.repeat(60));
-  }).catch(err => {
-    console.error('❌ Failed to load BIG model:', err);
-    console.error('   Stack:', err.stack);
+const watchdog = setInterval(() => {
+  if (inferenceQueue.activeAgeMs > INFERENCE_HARD_TIMEOUT_MS) {
+    console.error(`❌ Inference watchdog: "${inferenceQueue.activeLabel}" has been active for ${inferenceQueue.activeAgeMs}ms; exiting for container recovery`);
     process.exit(1);
+  }
+}, 10_000);
+watchdog.unref();
+
+for (const signal of ['SIGTERM', 'SIGINT']) {
+  process.on(signal, () => {
+    console.log(`${signal} received; shutting down`);
+    process.exit(0);
   });
+}
+
+process.on('uncaughtException', error => {
+  console.error('❌ Uncaught exception:', error);
+  process.exit(1);
+});
+process.on('unhandledRejection', error => {
+  console.error('❌ Unhandled rejection:', error);
+  process.exit(1);
+});
+
+app.listen(PORT, HOST, () => {
+  console.log(`🚀 BIG EMBEDDER listening on http://${HOST}:${PORT}`);
+  console.log(`🧯 Limits: batch=${MAX_BATCH_SIZE}, queue=${MAX_QUEUE_DEPTH}, cache=${MAX_CACHE_SIZE}, request=${REQUEST_TIMEOUT_MS}ms, watchdog=${INFERENCE_HARD_TIMEOUT_MS}ms`);
+  void loadModel();
 });
